@@ -1,0 +1,152 @@
+name: Scout Maven Auto Fix
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      image-ref:
+        description: "Image reference to scan (e.g. repo/name:tag or @sha256 digest)"
+        required: false
+        default: ""
+      image-repo:
+        description: "Docker Hub repository to resolve latest pushed tag from when image-ref is empty"
+        required: true
+        default: "antmedia/snapshot"
+      root-pom:
+        description: "Root pom.xml path"
+        required: true
+        default: "pom.xml"
+      severity:
+        description: "CSV severities for Scout"
+        required: true
+        default: "critical,high"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  scout-maven-autofix:
+    runs-on: ubuntu-latest
+    env:
+      SCOUT_IMAGE_REF_INPUT: ${{ github.event.inputs.image-ref || '' }}
+      SCOUT_IMAGE_REPO: ${{ github.event.inputs.image-repo || 'antmedia/snapshot' }}
+      ROOT_POM_PATH: ${{ github.event.inputs.root-pom || 'pom.xml' }}
+      SCOUT_SEVERITY: ${{ github.event.inputs.severity || 'critical,high' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+          cache: "maven"
+
+      - name: Resolve scan image reference
+        id: resolve-image
+        run: |
+          if [ -n "${SCOUT_IMAGE_REF_INPUT}" ]; then
+            IMAGE_REF="${SCOUT_IMAGE_REF_INPUT}"
+          else
+            API_URL="https://hub.docker.com/v2/repositories/${SCOUT_IMAGE_REPO}/tags?page_size=1&ordering=last_updated"
+            LATEST_TAG="$(curl -fsSL "${API_URL}" | python3 -c 'import json,sys; data=json.load(sys.stdin); results=data.get("results") or []; print((results[0].get("name") or "").strip() if results else "")')"
+            if [ -z "${LATEST_TAG}" ]; then
+              echo "Could not resolve latest tag from Docker Hub repository: ${SCOUT_IMAGE_REPO}"
+              exit 1
+            fi
+            IMAGE_REF="${SCOUT_IMAGE_REPO}:${LATEST_TAG}"
+          fi
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "Selected Scout image: ${IMAGE_REF}"
+
+      - name: Run Docker Scout CVE scan
+        id: scout
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: ${{ steps.resolve-image.outputs.image_ref }}
+          only-fixed: true
+          only-severities: ${{ env.SCOUT_SEVERITY }}
+          sarif-file: scout-results.sarif
+          summary: true
+          write-comment: false
+          exit-code: false
+
+      - name: Parse Scout SARIF into Maven update candidates
+        id: parse
+        run: |
+          python3 scripts/scout_to_maven_updates.py \
+            --sarif scout-results.sarif \
+            --output updates.json \
+            --summary updates-summary.md
+          HAS_UPDATES="$(python3 -c 'import json;print("true" if json.load(open("updates.json", "r", encoding="utf-8")).get("updates") else "false")')"
+          PRIMARY_CVE="$(python3 -c 'import json,re; d=json.load(open("updates.json","r",encoding="utf-8")); cves=sorted({c for u in d.get("updates",[]) for c in u.get("cves",[]) if re.fullmatch(r"CVE-\d{4}-\d+", c or "")}); print(cves[0] if cves else "")')"
+          echo "has_updates=${HAS_UPDATES}" >> "$GITHUB_OUTPUT"
+          echo "primary_cve=${PRIMARY_CVE}" >> "$GITHUB_OUTPUT"
+
+      - name: Update pom.xml files
+        id: patch
+        if: steps.parse.outputs.has_updates == 'true'
+        run: |
+          python3 scripts/update_pom_versions.py \
+            --root-pom "${ROOT_POM_PATH}" \
+            --updates updates.json \
+            --report changes-report.json
+          HAS_CHANGES="$(python3 -c 'import json;print("true" if json.load(open("changes-report.json", "r", encoding="utf-8")).get("changes") else "false")')"
+          echo "has_changes=${HAS_CHANGES}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Maven build
+        if: steps.patch.outputs.has_changes == 'true'
+        run: |
+          if [ -x "./mvnw" ]; then
+            ./mvnw -B -ntp -DskipTests validate
+          else
+            mvn -B -ntp -DskipTests validate
+          fi
+
+      - name: Render PR body
+        if: steps.patch.outputs.has_changes == 'true'
+        run: |
+          python3 scripts/render_pr_body.py \
+            --summary updates-summary.md \
+            --changes changes-report.json \
+            --output pr-body.md
+
+      - name: Generate branch name
+        id: branch
+        if: steps.patch.outputs.has_changes == 'true'
+        run: |
+          if [ -z "${{ steps.parse.outputs.primary_cve }}" ]; then
+            echo "Expected a CVE code for branch naming but none was found."
+            exit 1
+          fi
+          echo "name=${{ steps.parse.outputs.primary_cve }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create pull request
+        if: steps.patch.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "fix(security): apply Docker Scout Maven dependency fixes"
+          title: "fix(security): Docker Scout Maven CVE fixes"
+          body-path: pr-body.md
+          branch: ${{ steps.branch.outputs.name }}
+          delete-branch: false
+          labels: |
+            security
+            dependencies
+
+      - name: No-op message
+        if: steps.parse.outputs.has_updates != 'true' || steps.patch.outputs.has_changes != 'true'
+        run: |
+          echo "No fixed Maven CVE update found, or no pom.xml changes were required."
